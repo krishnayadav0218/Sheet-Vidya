@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html lang="hi">
+<head>
+<meta charset="UTF-8">
+<title>SheetVaidya — Excel ki har bimaari ka ilaaj</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --ink:#1C2321; --ink-soft:#262E2B; --paper:#EDEAE3; --paper-dim:#B9C1BD;
+    --gold:#D4A24C; --gold-soft:#e8c483; --blue:#7C93A8; --red:#C1554A; --green:#7C9A6E;
+    --line: rgba(237,234,227,0.12); --radius: 10px;
+  }
+  *{box-sizing:border-box; margin:0; padding:0;}
+  body{ background:var(--ink); color:var(--paper); font-family:'Inter',sans-serif; line-height:1.5; -webkit-font-smoothing:antialiased;}
+  .grid-bg{ position:fixed; inset:0; background-image: linear-gradient(var(--line) 1px, transparent 1px), linear-gradient(90deg, var(--line) 1px, transparent 1px); background-size: 42px 42px; pointer-events:none; z-index:0; mask-image: radial-gradient(ellipse 80% 60% at 50% 0%, black 40%, transparent 100%);}
+  .wrap{position:relative; z-index:1; max-width:1080px; margin:0 auto; padding: 0 24px;}
+
+  header.hero{padding: 56px 0 32px; text-align:center;}
+  .eyebrow{ font-family:'JetBrains Mono', monospace; font-size:12.5px; letter-spacing:0.14em; text-transform:uppercase; color:var(--gold); margin-bottom:18px;}
+  h1{ font-family:'Fraunces', serif; font-weight:600; font-size: clamp(30px, 4.6vw, 50px); line-height:1.08; letter-spacing:-0.01em; max-width: 780px; margin:0 auto 16px;}
+  h1 em{ font-style:italic; color:var(--gold);}
+  .sub{ max-width:560px; margin:0 auto 20px; color:var(--paper-dim); font-size:16px;}
+  .sub b{color:var(--paper); font-weight:600;}
+
+  .api-config{
+    display:inline-flex; align-items:center; gap:8px; margin: 0 auto 30px;
+    background:var(--ink-soft); border:1px solid var(--line); border-radius:999px;
+    padding:6px 8px 6px 16px; font-family:'JetBrains Mono',monospace; font-size:12px; color:var(--paper-dim);
+  }
+  .api-config input{
+    background:var(--ink); border:1px solid var(--line); border-radius:999px;
+    color:var(--gold-soft); font-family:'JetBrains Mono',monospace; font-size:12px;
+    padding:6px 12px; width:220px;
+  }
+  .api-config .dot{width:7px; height:7px; border-radius:50%; background:var(--paper-dim); display:inline-block;}
+  .api-config .dot.ok{background:var(--green);}
+  .api-config .dot.bad{background:var(--red);}
+
+  .panel{ background: var(--ink-soft); border:1px solid var(--line); border-radius: 16px; padding: 28px; margin-bottom:24px;}
+  .panel h2{ font-family:'Fraunces', serif; font-weight:600; font-size:20px; margin-bottom:6px;}
+  .panel .desc{color:var(--paper-dim); font-size:13.5px; margin-bottom:18px;}
+  .step-num{ font-family:'JetBrains Mono',monospace; color:var(--gold); font-size:12px; margin-bottom:8px; letter-spacing:0.08em;}
+
+  .dropzone{ border:1.5px dashed var(--paper-dim); border-radius:12px; padding: 30px 20px; text-align:center; cursor:pointer; transition: border-color .2s, background .2s;}
+  .dropzone:hover, .dropzone.drag{ border-color:var(--gold); background: rgba(212,162,76,0.06);}
+  .dropzone p{color:var(--paper-dim); font-size:14px; margin-top:6px;}
+  .dropzone .filename{ font-family:'JetBrains Mono',monospace; color:var(--gold-soft); font-size:14px;}
+  input[type=file]{display:none;}
+
+  table.preview{ width:100%; border-collapse:collapse; font-family:'JetBrains Mono',monospace; font-size:12px; display:block; overflow-x:auto; white-space:nowrap;}
+  table.preview th, table.preview td{ border:1px solid var(--line); padding:7px 9px; text-align:left;}
+  table.preview th{ background:var(--ink); color:var(--gold-soft); position:sticky; top:0;}
+  table.preview tr:nth-child(even) td{background: rgba(255,255,255,0.02);}
+  .table-scroll{max-height:260px; overflow:auto; border-radius:8px; border:1px solid var(--line); margin-top:14px;}
+  .table-scroll table.preview{border:none;}
+
+  .chips{display:flex; flex-wrap:wrap; gap:8px; margin: 14px 0 16px;}
+  .chip{ font-family:'JetBrains Mono',monospace; font-size:12px; padding:7px 12px; border-radius:999px; border:1px solid var(--line); background:var(--ink); color:var(--paper-dim); cursor:pointer; transition: all .15s;}
+  .chip:hover{border-color:var(--gold); color:var(--gold-soft);}
+
+  textarea, select{ width:100%; background:var(--ink); border:1px solid var(--line); border-radius:10px; color:var(--paper); font-family:'Inter',sans-serif; font-size:14px; padding:12px 14px;}
+  textarea{min-height:80px; resize:vertical;}
+  textarea:focus, select:focus{outline:none; border-color:var(--gold);}
+
+  .btn{ font-family:'Inter',sans-serif; font-weight:600; font-size:14px; padding:11px 20px; border-radius:9px; border:none; cursor:pointer; transition: transform .12s, opacity .12s;}
+  .btn:active{transform:scale(0.97);}
+  .btn-primary{background:var(--gold); color:var(--ink);}
+  .btn-primary:disabled{opacity:0.45; cursor:not-allowed;}
+  .btn-ghost{background:transparent; border:1px solid var(--line); color:var(--paper);}
+  .btn-danger{background: rgba(193,85,74,0.15); border:1px solid var(--red); color:var(--red);}
+  .btn-row{display:flex; gap:10px; margin-top:14px; align-items:center; flex-wrap:wrap;}
+
+  .status{ font-family:'JetBrains Mono',monospace; font-size:12px; color:var(--paper-dim);}
+  .status.err{color:var(--red);} .status.ok{color:var(--green);}
+
+  .explain-box{ background: rgba(212,162,76,0.08); border:1px solid rgba(212,162,76,0.3); border-radius:10px; padding:12px 15px; margin: 14px 0; font-size:13.5px; color:var(--paper);}
+  .explain-box b{color:var(--gold-soft);}
+
+  .dup-group{ border:1px solid var(--line); border-radius:10px; padding:12px 14px; margin-bottom:10px; background:var(--ink);}
+  .dup-group .glabel{font-family:'JetBrains Mono',monospace; font-size:11.5px; color:var(--paper-dim); margin-bottom:8px;}
+  .dup-row{ display:flex; align-items:center; gap:10px; padding:6px 0; font-size:13px; border-bottom:1px dashed var(--line);}
+  .dup-row:last-child{border-bottom:none;}
+  .dup-row .tag-keep{ font-family:'JetBrains Mono',monospace; font-size:10.5px; color:var(--green); border:1px solid var(--green); border-radius:6px; padding:1px 6px;}
+  .dup-row .tag-drop{ font-family:'JetBrains Mono',monospace; font-size:10.5px; color:var(--red); border:1px solid var(--red); border-radius:6px; padding:1px 6px;}
+
+  .anomaly-row{ display:flex; justify-content:space-between; align-items:center; padding:8px 12px; border:1px solid var(--line); border-radius:8px; margin-bottom:8px; font-size:13px; background:var(--ink);}
+  .anomaly-row .val{font-family:'JetBrains Mono',monospace; color:var(--red);}
+
+  .hidden{display:none !important;}
+  .spinner{ width:14px; height:14px; border-radius:50%; border:2px solid var(--line); border-top-color:var(--gold); display:inline-block; animation:spin 0.8s linear infinite; vertical-align:middle; margin-right:8px;}
+  @keyframes spin{to{transform:rotate(360deg);}}
+
+  .tab-row{display:flex; gap:8px; margin-bottom:18px; flex-wrap:wrap;}
+  .tab-btn{ font-family:'JetBrains Mono',monospace; font-size:12.5px; padding:9px 16px; border-radius:8px; border:1px solid var(--line); background:var(--ink); color:var(--paper-dim); cursor:pointer;}
+  .tab-btn.active{border-color:var(--gold); color:var(--gold-soft); background: rgba(212,162,76,0.08);}
+
+  footer{ text-align:center; color:var(--paper-dim); font-family:'JetBrains Mono',monospace; font-size:11px; padding: 26px 0 60px;}
+  @media (max-width:640px){ .panel{padding:18px;} .api-config{flex-direction:column; align-items:stretch; border-radius:14px; padding:12px;} .api-config input{width:100%;} }
+</style>
+</head>
+<body>
+<div class="grid-bg"></div>
+<div class="wrap">
+
+  <header class="hero">
+    <div class="eyebrow">FastAPI + pandas + scikit-learn + Claude</div>
+    <h1>Apni Excel file ki <em>bimaari</em> batao,<br>backend AI + ML se ilaaj karta hai.</h1>
+    <p class="sub">Bade files, fuzzy duplicate detection, aur numeric anomaly detection — sab server-side, real pandas ke saath.</p>
+
+    <div class="api-config">
+      <span class="dot" id="apiDot"></span>
+      <span>API:</span>
+      <input id="apiBase" value="http://localhost:8000" spellcheck="false">
+      <button class="btn btn-ghost" style="padding:5px 12px; font-size:11.5px;" id="checkApiBtn">Check</button>
+    </div>
+  </header>
+
+  <!-- STEP 1: UPLOAD -->
+  <section class="panel">
+    <div class="step-num">STEP 01</div>
+    <h2>File upload karo</h2>
+    <p class="desc">.xlsx, .xls ya .csv — server pandas se parse karega.</p>
+    <div class="dropzone" id="dropzone">
+      <div id="dzText">
+        <p style="color:var(--paper); font-size:15px; margin-bottom:4px;">Yahan click karo ya file kheecho</p>
+        <p>bade files bhi chalenge — processing backend par hoti hai</p>
+      </div>
+      <div id="dzFile" class="hidden">
+        <p class="filename" id="fileNameLabel"></p>
+        <p id="fileMeta"></p>
+      </div>
+    </div>
+    <input type="file" id="fileInput" accept=".xlsx,.xls,.csv">
+    <div id="uploadStatus" class="status" style="margin-top:10px;"></div>
+
+    <div id="previewSection" class="hidden" style="margin-top:8px;">
+      <div class="step-num" style="margin-top:8px;">PREVIEW (pehli 8 rows)</div>
+      <div class="table-scroll"><table class="preview" id="previewTable"></table></div>
+    </div>
+  </section>
+
+  <!-- STEP 2: TABS FOR FIX / DEDUPE / ANOMALY -->
+  <section class="panel" id="toolsPanel" style="display:none;">
+    <div class="step-num">STEP 02</div>
+    <h2>Cleanup tools</h2>
+    <div class="tab-row">
+      <button class="tab-btn active" data-tab="fix">AI Fix (natural language)</button>
+      <button class="tab-btn" data-tab="dedupe">Smart Duplicates (ML)</button>
+      <button class="tab-btn" data-tab="anomaly">Anomaly Detection (ML)</button>
+    </div>
+
+    <!-- TAB: AI FIX -->
+    <div class="tab-content" id="tab-fix">
+      <p class="desc">Jaise baat karte ho waise hi likho — Hindi, English ya mix.</p>
+      <div class="chips" id="chips">
+        <div class="chip" data-text="Duplicate rows hatao">Duplicate hatao</div>
+        <div class="chip" data-text="Sabhi blank/empty cells ko 'N/A' se fill karo">Blank cells fill karo</div>
+        <div class="chip" data-text="Sabhi text columns ke extra spaces (trim) hatao">Extra space trim karo</div>
+        <div class="chip" data-text="Date column ko DD-MM-YYYY format mein convert karo">Date format sahi karo</div>
+        <div class="chip" data-text="Column names ke case aur spacing ko clean karo">Headers clean karo</div>
+        <div class="chip" data-text="Numeric column mein se currency symbol aur commas hata kar sirf number rakho">Number clean karo</div>
+      </div>
+      <textarea id="instruction" placeholder="Jaise: 'Salary column se ₹ aur comma hata do' ya 'City column ke naam properly capitalize kar do'"></textarea>
+      <div class="btn-row">
+        <button class="btn btn-primary" id="fixBtn">Fix karo →</button>
+        <span class="status" id="fixStatus"></span>
+      </div>
+      <div id="explainBox" class="explain-box hidden"></div>
+    </div>
+
+    <!-- TAB: DEDUPE -->
+    <div class="tab-content hidden" id="tab-dedupe">
+      <p class="desc">Fuzzy matching se near-duplicate rows dhoondta hai — jaise "Ravi Kumar" aur "ravi  kumar".</p>
+      <div class="btn-row" style="margin-top:0;">
+        <label style="font-size:13px; color:var(--paper-dim);">Threshold:</label>
+        <select id="dupeThreshold" style="width:auto; padding:8px 12px;">
+          <option value="95">95 (bahut strict)</option>
+          <option value="87" selected>87 (default)</option>
+          <option value="75">75 (loose)</option>
+        </select>
+        <button class="btn btn-primary" id="findDupesBtn">Duplicates dhoondo</button>
+        <span class="status" id="dupeStatus"></span>
+      </div>
+      <div id="dupeGroups" style="margin-top:16px;"></div>
+      <div class="btn-row hidden" id="dupeApplyRow">
+        <button class="btn btn-danger" id="applyDedupeBtn">Selected duplicates hatao</button>
+      </div>
+    </div>
+
+    <!-- TAB: ANOMALY -->
+    <div class="tab-content hidden" id="tab-anomaly">
+      <p class="desc">Ek numeric column choose karo — IsolationForest model unusual values flag karega (jaise galti se extra zero).</p>
+      <div class="btn-row" style="margin-top:0;">
+        <select id="anomalyColumn" style="width:220px;"></select>
+        <button class="btn btn-primary" id="findAnomaliesBtn">Anomalies dhoondo</button>
+        <span class="status" id="anomalyStatus"></span>
+      </div>
+      <div id="anomalyResults" style="margin-top:16px;"></div>
+      <div class="btn-row hidden" id="anomalyApplyRow">
+        <button class="btn btn-danger" id="dropAnomaliesBtn">Flagged rows hatao</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- STEP 3: RESULT / DOWNLOAD -->
+  <section class="panel hidden" id="resultPanel">
+    <div class="step-num">RESULT</div>
+    <h2>Current working data</h2>
+    <div class="table-scroll"><table class="preview" id="resultTable"></table></div>
+    <div class="btn-row">
+      <button class="btn btn-primary" id="downloadBtn">Fixed file download karo (.xlsx)</button>
+      <button class="btn btn-ghost" id="resetBtn">Original par reset karo</button>
+    </div>
+  </section>
+
+  <footer>SheetVaidya backend demo · FastAPI + pandas + scikit-learn + Claude Sonnet</footer>
+</div>
+
+<script>
+let sessionId = null;
+let columns = [];
+
+const $ = (id) => document.getElementById(id);
+const apiBaseInput = $('apiBase');
+const apiDot = $('apiDot');
+
+function apiBase(){ return apiBaseInput.value.replace(/\/$/, ''); }
+
+async function checkApi(){
+  try{
+    const res = await fetch(apiBase() + '/health');
+    apiDot.className = res.ok ? 'dot ok' : 'dot bad';
+  }catch(e){ apiDot.className = 'dot bad'; }
+}
+$('checkApiBtn').addEventListener('click', checkApi);
+checkApi();
+
+function escapeHtml(str){
+  return String(str).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+}
+function renderTable(tableEl, rows, cols){
+  let html = '<thead><tr>' + cols.map(c => '<th>'+escapeHtml(c)+'</th>').join('') + '</tr></thead><tbody>';
+  rows.forEach(r => { html += '<tr>' + cols.map(c => '<td>'+escapeHtml(r[c] ?? '')+'</td>').join('') + '</tr>'; });
+  tableEl.innerHTML = html + '</tbody>';
+}
+function setStatus(el, msg, isErr=false, isOk=false){
+  el.textContent = msg;
+  el.className = 'status' + (isErr ? ' err' : '') + (isOk ? ' ok' : '');
+}
+
+/* ---------------- Upload ---------------- */
+const dropzone = $('dropzone'), fileInput = $('fileInput');
+dropzone.addEventListener('click', () => fileInput.click());
+dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.classList.add('drag'); });
+dropzone.addEventListener('dragleave', () => dropzone.classList.remove('drag'));
+dropzone.addEventListener('drop', e => { e.preventDefault(); dropzone.classList.remove('drag'); if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]); });
+fileInput.addEventListener('change', e => { if (e.target.files.length) handleFile(e.target.files[0]); });
+
+async function handleFile(file){
+  setStatus($('uploadStatus'), 'Upload ho raha hai...');
+  const formData = new FormData();
+  formData.append('file', file);
+  try{
+    const res = await fetch(apiBase() + '/upload', { method:'POST', body: formData });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Upload fail hua.');
+
+    sessionId = data.session_id;
+    columns = data.columns;
+
+    $('dzText').classList.add('hidden');
+    $('dzFile').classList.remove('hidden');
+    $('fileNameLabel').textContent = data.filename;
+    $('fileMeta').textContent = data.row_count + ' rows · ' + columns.length + ' columns';
+
+    renderTable($('previewTable'), data.rows, columns);
+    $('previewSection').classList.remove('hidden');
+    $('toolsPanel').style.display = 'block';
+    $('resultPanel').classList.add('hidden');
+    populateAnomalyColumns();
+    setStatus($('uploadStatus'), '');
+  }catch(err){
+    setStatus($('uploadStatus'), 'Error: ' + err.message, true);
+  }
+}
+
+function populateAnomalyColumns(){
+  const sel = $('anomalyColumn');
+  sel.innerHTML = columns.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('');
+}
+
+/* ---------------- Tabs ---------------- */
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.tab-content').forEach(c => c.classList.add('hidden'));
+    btn.classList.add('active');
+    $('tab-' + btn.dataset.tab).classList.remove('hidden');
+  });
+});
+
+/* ---------------- AI Fix ---------------- */
+document.querySelectorAll('.chip').forEach(chip => {
+  chip.addEventListener('click', () => { $('instruction').value = chip.getAttribute('data-text'); });
+});
+
+$('fixBtn').addEventListener('click', async () => {
+  if (!sessionId) return setStatus($('fixStatus'), 'Pehle file upload karo.', true);
+  const instructionText = $('instruction').value.trim();
+  if (!instructionText) return setStatus($('fixStatus'), 'Pehle condition likho.', true);
+
+  $('fixBtn').disabled = true;
+  $('fixStatus').innerHTML = '<span class="spinner"></span> Samajh raha hoon...';
+  try{
+    const res = await fetch(apiBase() + '/fix', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ session_id: sessionId, instruction: instructionText })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Fix fail hua.');
+
+    columns = data.columns;
+    $('explainBox').classList.remove('hidden');
+    $('explainBox').innerHTML = '<b>Kya kiya:</b> ' + escapeHtml(data.explanation || 'Fix apply ho gaya.');
+    showResult(data.rows, columns);
+    populateAnomalyColumns();
+    setStatus($('fixStatus'), 'Ho gaya.', false, true);
+  }catch(err){
+    setStatus($('fixStatus'), 'Error: ' + err.message, true);
+  }finally{
+    $('fixBtn').disabled = false;
+  }
+});
+
+/* ---------------- Smart Duplicates ---------------- */
+let currentDupeGroups = [];
+
+$('findDupesBtn').addEventListener('click', async () => {
+  if (!sessionId) return setStatus($('dupeStatus'), 'Pehle file upload karo.', true);
+  $('findDupesBtn').disabled = true;
+  $('dupeStatus').innerHTML = '<span class="spinner"></span> Fuzzy matching chal rahi hai...';
+  try{
+    const threshold = parseInt($('dupeThreshold').value, 10);
+    const res = await fetch(apiBase() + '/smart-duplicates', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ session_id: sessionId, threshold })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Search fail hui.');
+
+    currentDupeGroups = data.groups;
+    renderDupeGroups();
+    setStatus($('dupeStatus'), data.groups.length + ' possible duplicate group(s) mile.', false, true);
+  }catch(err){
+    setStatus($('dupeStatus'), 'Error: ' + err.message, true);
+  }finally{
+    $('findDupesBtn').disabled = false;
+  }
+});
+
+function renderDupeGroups(){
+  const container = $('dupeGroups');
+  if (!currentDupeGroups.length){
+    container.innerHTML = '<p class="desc">Koi duplicate nahi mila.</p>';
+    $('dupeApplyRow').classList.add('hidden');
+    return;
+  }
+  container.innerHTML = currentDupeGroups.map((g, gi) => `
+    <div class="dup-group">
+      <div class="glabel">GROUP ${gi+1} · ${g.row_indices.length} similar rows</div>
+      ${g.rows.map((r, ri) => {
+        const rowIndex = g.row_indices[ri];
+        const isKeep = rowIndex === g.suggested_keep_index;
+        return `<div class="dup-row">
+          <input type="checkbox" class="dupe-checkbox" data-row="${rowIndex}" ${isKeep ? '' : 'checked'}>
+          <span class="${isKeep ? 'tag-keep' : 'tag-drop'}">${isKeep ? 'RAKHO' : 'HATAO'}</span>
+          <span>${Object.values(r).map(v => escapeHtml(v)).join(' · ')}</span>
+        </div>`;
+      }).join('')}
+    </div>
+  `).join('');
+  $('dupeApplyRow').classList.remove('hidden');
+}
+
+$('applyDedupeBtn').addEventListener('click', async () => {
+  const checked = Array.from(document.querySelectorAll('.dupe-checkbox:checked')).map(el => parseInt(el.dataset.row, 10));
+  if (!checked.length) return setStatus($('dupeStatus'), 'Koi row select nahi ki hataane ke liye.', true);
+  try{
+    const res = await fetch(apiBase() + '/apply-dedupe', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ session_id: sessionId, drop_indices: checked })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Dedupe fail hua.');
+    columns = data.columns;
+    showResult(data.rows, columns);
+    currentDupeGroups = [];
+    $('dupeGroups').innerHTML = '';
+    $('dupeApplyRow').classList.add('hidden');
+    setStatus($('dupeStatus'), checked.length + ' rows hata di gayi.', false, true);
+  }catch(err){
+    setStatus($('dupeStatus'), 'Error: ' + err.message, true);
+  }
+});
+
+/* ---------------- Anomaly Detection ---------------- */
+let currentAnomalies = [];
+
+$('findAnomaliesBtn').addEventListener('click', async () => {
+  if (!sessionId) return setStatus($('anomalyStatus'), 'Pehle file upload karo.', true);
+  const column = $('anomalyColumn').value;
+  $('findAnomaliesBtn').disabled = true;
+  $('anomalyStatus').innerHTML = '<span class="spinner"></span> Model chal raha hai...';
+  try{
+    const res = await fetch(apiBase() + '/detect-anomalies', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ session_id: sessionId, column })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Detection fail hui.');
+
+    currentAnomalies = data.flagged || [];
+    renderAnomalies(column, data.median);
+    setStatus($('anomalyStatus'), (data.flagged_count ?? currentAnomalies.length) + ' unusual value(s) mile.', false, true);
+  }catch(err){
+    setStatus($('anomalyStatus'), 'Error: ' + err.message, true);
+  }finally{
+    $('findAnomaliesBtn').disabled = false;
+  }
+});
+
+function renderAnomalies(column, median){
+  const container = $('anomalyResults');
+  if (!currentAnomalies.length){
+    container.innerHTML = '<p class="desc">Koi unusual value nahi mila.</p>';
+    $('anomalyApplyRow').classList.add('hidden');
+    return;
+  }
+  container.innerHTML = `<p class="desc">Column "${escapeHtml(column)}" ka median ~${median}. Ye rows alag lag rahi hain:</p>` +
+    currentAnomalies.map(a => `
+      <div class="anomaly-row">
+        <span>Row ${a.row_index}</span>
+        <span class="val">${a.value}</span>
+        <input type="checkbox" class="anomaly-checkbox" data-row="${a.row_index}" checked>
+      </div>
+    `).join('');
+  $('anomalyApplyRow').classList.remove('hidden');
+}
+
+$('dropAnomaliesBtn').addEventListener('click', async () => {
+  const checked = Array.from(document.querySelectorAll('.anomaly-checkbox:checked')).map(el => parseInt(el.dataset.row, 10));
+  if (!checked.length) return setStatus($('anomalyStatus'), 'Koi row select nahi ki hataane ke liye.', true);
+  try{
+    const res = await fetch(apiBase() + '/drop-rows', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ session_id: sessionId, row_indices: checked })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Drop fail hua.');
+    columns = data.columns;
+    showResult(data.rows, columns);
+    currentAnomalies = [];
+    $('anomalyResults').innerHTML = '';
+    $('anomalyApplyRow').classList.add('hidden');
+    setStatus($('anomalyStatus'), checked.length + ' rows hata di gayi.', false, true);
+  }catch(err){
+    setStatus($('anomalyStatus'), 'Error: ' + err.message, true);
+  }
+});
+
+/* ---------------- Result + Download + Reset ---------------- */
+function showResult(rows, cols){
+  renderTable($('resultTable'), rows, cols);
+  $('resultPanel').classList.remove('hidden');
+  $('resultPanel').scrollIntoView({behavior:'smooth', block:'start'});
+}
+
+$('downloadBtn').addEventListener('click', () => {
+  if (!sessionId) return;
+  window.location.href = apiBase() + '/download/' + sessionId;
+});
+
+$('resetBtn').addEventListener('click', async () => {
+  if (!sessionId) return;
+  const res = await fetch(apiBase() + '/reset?session_id=' + sessionId, { method:'POST' });
+  const data = await res.json();
+  if (res.ok){
+    columns = data.columns;
+    renderTable($('previewTable'), data.rows, columns);
+    showResult(data.rows, columns);
+    populateAnomalyColumns();
+  }
+});
+</script>
+</body>
+</html>
