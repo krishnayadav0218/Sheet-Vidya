@@ -1,88 +1,120 @@
 """
-Simple in-memory session store.
+Redis-backed session store (needed for serverless hosts like Vercel, where
+each request can land on a different, stateless function instance — an
+in-memory Python dict would not survive between requests).
 
-Each uploaded file gets a session_id (uuid4). We keep the ORIGINAL dataframe
-(never mutated, used for "reset") and the WORKING dataframe (mutated by each
-fix / dedupe / anomaly-removal step, used for preview + download).
+Each session is stored as a Redis HASH:
+    session:{id} -> {
+        "filename": str,
+        "original": <parquet bytes>   # never mutated, used for /reset
+        "working":  <parquet bytes>   # mutated by each fix/dedupe/drop step
+        "history":  json list of {"instruction": ..., "explanation": ...}
+    }
+with a TTL so abandoned sessions clean themselves up.
 
-This is intentionally simple (a process-local dict). For a real deployment
-with multiple workers, swap this for Redis or a database keyed by session_id,
-storing either the dataframe serialized to parquet bytes or a file path.
+Works with any Redis-protocol store: Vercel KV, Upstash, Railway Redis,
+a local `redis-server`, etc. — just point REDIS_URL at it.
 """
 
-import time
+import io
+import json
+import os
 import uuid
-from dataclasses import dataclass, field
-from threading import Lock
-from typing import Dict, Optional
+from typing import List, Optional
 
 import pandas as pd
+import redis
 
 SESSION_TTL_SECONDS = 60 * 60 * 2  # 2 hours
 
-
-@dataclass
-class Session:
-    session_id: str
-    filename: str
-    original_df: pd.DataFrame
-    working_df: pd.DataFrame
-    created_at: float = field(default_factory=time.time)
-    last_used: float = field(default_factory=time.time)
-    history: list = field(default_factory=list)  # list of {"instruction": str, "explanation": str}
+_redis_client: Optional["redis.Redis"] = None
 
 
-class SessionStore:
-    def __init__(self):
-        self._sessions: Dict[str, Session] = {}
-        self._lock = Lock()
-
-    def create(self, filename: str, df: pd.DataFrame) -> Session:
-        session_id = str(uuid.uuid4())
-        session = Session(
-            session_id=session_id,
-            filename=filename,
-            original_df=df.copy(),
-            working_df=df.copy(),
-        )
-        with self._lock:
-            self._sessions[session_id] = session
-        return session
-
-    def get(self, session_id: str) -> Optional[Session]:
-        self._cleanup_expired()
-        with self._lock:
-            session = self._sessions.get(session_id)
-            if session:
-                session.last_used = time.time()
-            return session
-
-    def update_working_df(self, session_id: str, df: pd.DataFrame, instruction: str = "", explanation: str = ""):
-        with self._lock:
-            session = self._sessions.get(session_id)
-            if not session:
-                raise KeyError(f"Session {session_id} not found")
-            session.working_df = df
-            session.last_used = time.time()
-            if instruction or explanation:
-                session.history.append({"instruction": instruction, "explanation": explanation})
-            return session
-
-    def reset(self, session_id: str) -> Session:
-        with self._lock:
-            session = self._sessions.get(session_id)
-            if not session:
-                raise KeyError(f"Session {session_id} not found")
-            session.working_df = session.original_df.copy()
-            session.history = []
-            return session
-
-    def _cleanup_expired(self):
-        now = time.time()
-        with self._lock:
-            expired = [sid for sid, s in self._sessions.items() if now - s.last_used > SESSION_TTL_SECONDS]
-            for sid in expired:
-                del self._sessions[sid]
+def _client() -> "redis.Redis":
+    global _redis_client
+    if _redis_client is None:
+        url = os.environ.get("REDIS_URL") or os.environ.get("KV_URL")
+        if not url:
+            raise RuntimeError(
+                "REDIS_URL (ya KV_URL) env var set nahi hai. Vercel KV / Upstash "
+                "Redis bana kar us connection string ko set karo."
+            )
+        _redis_client = redis.from_url(url)
+    return _redis_client
 
 
-store = SessionStore()
+def _key(session_id: str) -> str:
+    return f"session:{session_id}"
+
+
+def _df_to_bytes(df: pd.DataFrame) -> bytes:
+    buf = io.BytesIO()
+    df.to_parquet(buf, index=False)
+    return buf.getvalue()
+
+
+def _bytes_to_df(raw: bytes) -> pd.DataFrame:
+    return pd.read_parquet(io.BytesIO(raw))
+
+
+class SessionNotFound(Exception):
+    pass
+
+
+def create(filename: str, df: pd.DataFrame) -> str:
+    session_id = str(uuid.uuid4())
+    parquet_bytes = _df_to_bytes(df)
+    key = _key(session_id)
+    r = _client()
+    r.hset(key, mapping={
+        "filename": filename,
+        "original": parquet_bytes,
+        "working": parquet_bytes,
+        "history": json.dumps([]),
+    })
+    r.expire(key, SESSION_TTL_SECONDS)
+    return session_id
+
+
+def get_working_df(session_id: str) -> pd.DataFrame:
+    raw = _client().hget(_key(session_id), "working")
+    if raw is None:
+        raise SessionNotFound(session_id)
+    return _bytes_to_df(raw)
+
+
+def get_filename(session_id: str) -> str:
+    raw = _client().hget(_key(session_id), "filename")
+    if raw is None:
+        raise SessionNotFound(session_id)
+    return raw.decode("utf-8")
+
+
+def exists(session_id: str) -> bool:
+    return _client().exists(_key(session_id)) == 1
+
+
+def update_working_df(session_id: str, df: pd.DataFrame, instruction: str = "", explanation: str = ""):
+    if not exists(session_id):
+        raise SessionNotFound(session_id)
+    key = _key(session_id)
+    r = _client()
+    updates = {"working": _df_to_bytes(df)}
+    if instruction or explanation:
+        hist_raw = r.hget(key, "history")
+        history: List[dict] = json.loads(hist_raw) if hist_raw else []
+        history.append({"instruction": instruction, "explanation": explanation})
+        updates["history"] = json.dumps(history)
+    r.hset(key, mapping=updates)
+    r.expire(key, SESSION_TTL_SECONDS)  # refresh TTL on activity
+
+
+def reset(session_id: str) -> pd.DataFrame:
+    key = _key(session_id)
+    r = _client()
+    original = r.hget(key, "original")
+    if original is None:
+        raise SessionNotFound(session_id)
+    r.hset(key, mapping={"working": original, "history": json.dumps([])})
+    r.expire(key, SESSION_TTL_SECONDS)
+    return _bytes_to_df(original)

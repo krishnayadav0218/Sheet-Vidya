@@ -1,22 +1,28 @@
 """
-SheetVaidya backend — FastAPI + pandas + Claude + scikit-learn.
+SheetVaidya backend — FastAPI + pandas + Claude, Redis-backed sessions
+(works on serverless hosts like Vercel, where every request can hit a
+different, stateless function instance).
 
-Run:
+Run locally:
     uvicorn app.main:app --reload
 
 Env:
-    ANTHROPIC_API_KEY must be set for the /fix endpoint to work.
+    ANTHROPIC_API_KEY  required for the /fix endpoint
+    REDIS_URL          required for session storage (Vercel KV / Upstash /
+                        any Redis-protocol store). KV_URL also works.
 
 Endpoints:
-    POST /upload                -> upload a file, get session_id + preview
-    GET  /preview/{session_id}  -> current working-data preview
-    POST /fix                   -> plain-language instruction -> pandas transform
-    POST /reset                 -> undo all fixes, back to original upload
-    POST /smart-duplicates      -> find fuzzy/near-duplicate row groups
-    POST /apply-dedupe          -> drop chosen duplicate rows
-    POST /detect-anomalies      -> flag outlier values in a numeric column
-    POST /drop-rows             -> drop arbitrary row indices (e.g. anomalies)
-    GET  /download/{session_id} -> download working data as .xlsx
+    GET  /                       -> friendly landing JSON (see /docs)
+    GET  /health                 -> liveness check
+    POST /upload                 -> upload a file, get session_id + preview
+    GET  /preview/{session_id}   -> current working-data preview
+    POST /reset                  -> undo all fixes, back to original upload
+    POST /fix                    -> plain-language instruction -> pandas transform
+    POST /smart-duplicates       -> find fuzzy/near-duplicate row groups
+    POST /apply-dedupe           -> drop chosen duplicate rows
+    POST /detect-anomalies       -> flag outlier values in a numeric column
+    POST /drop-rows              -> drop arbitrary row indices (e.g. anomalies)
+    GET  /download/{session_id}  -> download working data as .xlsx
 """
 
 from typing import List, Optional
@@ -26,9 +32,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
 
-from app import excel_io, ml_tools
+from app import excel_io, ml_tools, session_store as sessions
 from app.ai_interpreter import TransformError, apply_transform, generate_transform
-from app.session_store import store
 
 app = FastAPI(title="SheetVaidya API")
 
@@ -65,12 +70,32 @@ class ApplyDedupeRequest(BaseModel):
 class AnomalyRequest(BaseModel):
     session_id: str
     column: str
-    contamination: float = 0.05
+    threshold: float = 3.5
 
 
 class DropRowsRequest(BaseModel):
     session_id: str
     row_indices: List[int]
+
+
+# --------------------------------------------------------------------------- #
+# Root / health
+# --------------------------------------------------------------------------- #
+
+@app.get("/")
+def root():
+    return {
+        "name": "SheetVaidya API",
+        "status": "running",
+        "docs": "/docs",
+        "health": "/health",
+        "note": "Ye ek API hai, browser mein root URL par koi UI nahi hai — /docs kholo ya frontend/index.html use karo.",
+    }
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 
 # --------------------------------------------------------------------------- #
@@ -91,23 +116,27 @@ async def upload(file: UploadFile = File(...)):
     if df.empty:
         raise HTTPException(400, "Is file mein koi data nahi mila.")
 
-    session = store.create(file.filename, df)
-    preview = excel_io.df_preview(session.working_df)
+    try:
+        session_id = sessions.create(file.filename, df)
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
 
-    return {"session_id": session.session_id, "filename": file.filename, **preview}
+    return {"session_id": session_id, "filename": file.filename, **excel_io.df_preview(df)}
 
 
 @app.get("/preview/{session_id}")
 def preview(session_id: str, rows: int = 10):
-    session = _get_session_or_404(session_id)
-    return excel_io.df_preview(session.working_df, n=rows)
+    df = _get_df_or_404(session_id)
+    return excel_io.df_preview(df, n=rows)
 
 
 @app.post("/reset")
 def reset(session_id: str):
-    session = _get_session_or_404(session_id)
-    session = store.reset(session_id)
-    return {"status": "reset", **excel_io.df_preview(session.working_df)}
+    try:
+        df = sessions.reset(session_id)
+    except sessions.SessionNotFound:
+        raise HTTPException(404, "Session nahi mila — file dobara upload karo.")
+    return {"status": "reset", **excel_io.df_preview(df)}
 
 
 # --------------------------------------------------------------------------- #
@@ -116,8 +145,7 @@ def reset(session_id: str):
 
 @app.post("/fix")
 def fix(payload: FixRequest):
-    session = _get_session_or_404(payload.session_id)
-    df = session.working_df
+    df = _get_df_or_404(payload.session_id)
 
     if not payload.instruction.strip():
         raise HTTPException(400, "Instruction khali hai.")
@@ -137,7 +165,7 @@ def fix(payload: FixRequest):
     except Exception as e:  # noqa: BLE001
         raise HTTPException(500, f"Unexpected error: {e}")
 
-    store.update_working_df(
+    sessions.update_working_df(
         payload.session_id, new_df,
         instruction=payload.instruction,
         explanation=parsed.get("explanation", ""),
@@ -156,18 +184,15 @@ def fix(payload: FixRequest):
 
 @app.post("/smart-duplicates")
 def smart_duplicates(payload: DedupeRequest):
-    session = _get_session_or_404(payload.session_id)
-    result = ml_tools.find_smart_duplicates(
-        session.working_df, columns=payload.columns, threshold=payload.threshold
-    )
-    return result
+    df = _get_df_or_404(payload.session_id)
+    return ml_tools.find_smart_duplicates(df, columns=payload.columns, threshold=payload.threshold)
 
 
 @app.post("/apply-dedupe")
 def apply_dedupe(payload: ApplyDedupeRequest):
-    session = _get_session_or_404(payload.session_id)
-    new_df = ml_tools.apply_dedupe(session.working_df, payload.drop_indices)
-    store.update_working_df(
+    df = _get_df_or_404(payload.session_id)
+    new_df = ml_tools.apply_dedupe(df, payload.drop_indices)
+    sessions.update_working_df(
         payload.session_id, new_df,
         instruction="[smart-dedupe]",
         explanation=f"{len(payload.drop_indices)} duplicate rows hataye gaye.",
@@ -176,16 +201,14 @@ def apply_dedupe(payload: ApplyDedupeRequest):
 
 
 # --------------------------------------------------------------------------- #
-# ML: numeric anomaly detection
+# ML: numeric anomaly detection (median absolute deviation — no heavy deps)
 # --------------------------------------------------------------------------- #
 
 @app.post("/detect-anomalies")
 def detect_anomalies(payload: AnomalyRequest):
-    session = _get_session_or_404(payload.session_id)
+    df = _get_df_or_404(payload.session_id)
     try:
-        result = ml_tools.detect_anomalies(
-            session.working_df, payload.column, contamination=payload.contamination
-        )
+        result = ml_tools.detect_anomalies(df, payload.column, threshold=payload.threshold)
     except ValueError as e:
         raise HTTPException(400, str(e))
     return result
@@ -193,9 +216,9 @@ def detect_anomalies(payload: AnomalyRequest):
 
 @app.post("/drop-rows")
 def drop_rows(payload: DropRowsRequest):
-    session = _get_session_or_404(payload.session_id)
-    new_df = session.working_df.drop(index=payload.row_indices).reset_index(drop=True)
-    store.update_working_df(
+    df = _get_df_or_404(payload.session_id)
+    new_df = df.drop(index=payload.row_indices).reset_index(drop=True)
+    sessions.update_working_df(
         payload.session_id, new_df,
         instruction="[manual-drop]",
         explanation=f"{len(payload.row_indices)} rows manually hataye gaye.",
@@ -209,8 +232,8 @@ def drop_rows(payload: DropRowsRequest):
 
 @app.get("/download/{session_id}")
 def download(session_id: str):
-    session = _get_session_or_404(session_id)
-    xlsx_bytes = excel_io.df_to_xlsx_bytes(session.working_df)
+    df = _get_df_or_404(session_id)
+    xlsx_bytes = excel_io.df_to_xlsx_bytes(df)
     return Response(
         content=xlsx_bytes,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -220,13 +243,8 @@ def download(session_id: str):
 
 # --------------------------------------------------------------------------- #
 
-def _get_session_or_404(session_id: str):
-    session = store.get(session_id)
-    if not session:
+def _get_df_or_404(session_id: str):
+    try:
+        return sessions.get_working_df(session_id)
+    except sessions.SessionNotFound:
         raise HTTPException(404, "Session nahi mila — file dobara upload karo.")
-    return session
-
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
