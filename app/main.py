@@ -1,0 +1,371 @@
+"""
+SheetVaidya backend — FastAPI + pandas + Claude, Redis-backed sessions
+(works on serverless hosts like Vercel, where every request can hit a
+different, stateless function instance).
+
+Run locally:
+    uvicorn app.main:app --reload
+
+Env:
+    ANTHROPIC_API_KEY  required for the /fix endpoint
+    REDIS_URL          required for session storage (Vercel KV / Upstash /
+                        any Redis-protocol store). KV_URL also works.
+
+Endpoints (all under /api — this lets the same Vercel deployment also
+serve the static frontend at the site root, see vercel.json):
+    GET  /api                        -> friendly landing JSON (see /docs)
+    GET  /api/health                 -> liveness check
+    POST /api/upload                 -> upload a file, get session_id + preview
+    GET  /api/preview/{session_id}   -> current working-data preview
+    POST /api/reset                  -> undo all fixes, back to original upload
+    POST /api/fix                    -> plain-language instruction -> pandas transform
+    POST /api/smart-duplicates       -> find fuzzy/near-duplicate row groups
+    POST /api/apply-dedupe           -> drop chosen duplicate rows
+    POST /api/detect-anomalies       -> flag outlier values in a numeric column
+    POST /api/drop-rows              -> drop arbitrary row indices (e.g. anomalies)
+    POST /api/missing-values         -> per-column missing-value report + suggested fill
+    POST /api/fill-missing           -> apply a fill strategy per column
+    GET  /api/quality-report/{id}    -> overall data-quality score (0-100) + issue list
+    POST /api/undo                   -> step back one change (multi-step, not just reset)
+    POST /api/redo                   -> re-apply a change that was undone
+    GET  /api/history/{session_id}   -> fix history + can_undo/can_redo flags
+    GET  /api/download/{session_id}  -> download as .xlsx / .csv / .pdf (?format=)
+"""
+
+from typing import Any, Dict, List, Optional
+
+from fastapi import APIRouter, FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
+from pydantic import BaseModel
+
+from app import excel_io, ml_tools, quality, report_pdf, session_store as sessions
+from app.ai_interpreter import TransformError, apply_transform, generate_transform
+
+app = FastAPI(title="SheetVaidya API")
+router = APIRouter(prefix="/api")
+
+# Loosen CORS for local dev / demo. Lock this down to your real frontend
+# origin(s) before deploying anywhere public.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# --------------------------------------------------------------------------- #
+# Request/response models
+# --------------------------------------------------------------------------- #
+
+class FixRequest(BaseModel):
+    session_id: str
+    instruction: str
+
+
+class DedupeRequest(BaseModel):
+    session_id: str
+    columns: Optional[List[str]] = None
+    threshold: int = 87
+
+
+class ApplyDedupeRequest(BaseModel):
+    session_id: str
+    drop_indices: List[int]
+
+
+class AnomalyRequest(BaseModel):
+    session_id: str
+    column: str
+    threshold: float = 3.5
+
+
+class DropRowsRequest(BaseModel):
+    session_id: str
+    row_indices: List[int]
+
+
+class MissingValuesRequest(BaseModel):
+    session_id: str
+
+
+class FillMissingRequest(BaseModel):
+    session_id: str
+    # {"column_name": {"method": "mean"|"median"|"mode"|"constant"|"ffill"|"bfill"|"drop_rows", "value": <for constant>}}
+    strategies: Dict[str, Dict[str, Any]]
+
+
+class SessionIdRequest(BaseModel):
+    session_id: str
+
+
+# --------------------------------------------------------------------------- #
+# Root / health
+# --------------------------------------------------------------------------- #
+
+@router.get("/")
+def root():
+    return {
+        "name": "SheetVaidya API",
+        "status": "running",
+        "docs": "/docs",
+        "health": "/api/health",
+        "note": "Ye API /api ke neeche hai. UI ke liye site ka root URL (/) frontend/index.html serve karta hai.",
+    }
+
+
+@router.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+# --------------------------------------------------------------------------- #
+# Upload / preview / reset
+# --------------------------------------------------------------------------- #
+
+@router.post("/upload")
+async def upload(file: UploadFile = File(...)):
+    content = await file.read()
+    if not content:
+        raise HTTPException(400, "File khali hai.")
+
+    try:
+        df = excel_io.read_upload(file.filename, content)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(400, f"File padhne mein error: {e}")
+
+    if df.empty:
+        raise HTTPException(400, "Is file mein koi data nahi mila.")
+
+    try:
+        session_id = sessions.create(file.filename, df)
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+
+    return {"session_id": session_id, "filename": file.filename, **excel_io.df_preview(df)}
+
+
+@router.get("/preview/{session_id}")
+def preview(session_id: str, rows: int = 10):
+    df = _get_df_or_404(session_id)
+    return excel_io.df_preview(df, n=rows)
+
+
+@router.post("/reset")
+def reset(session_id: str):
+    try:
+        df = sessions.reset(session_id)
+    except sessions.SessionNotFound:
+        raise HTTPException(404, "Session nahi mila — file dobara upload karo.")
+    return {"status": "reset", **excel_io.df_preview(df)}
+
+
+# --------------------------------------------------------------------------- #
+# AI-driven natural-language fix
+# --------------------------------------------------------------------------- #
+
+@router.post("/fix")
+def fix(payload: FixRequest):
+    df = _get_df_or_404(payload.session_id)
+
+    if not payload.instruction.strip():
+        raise HTTPException(400, "Instruction khali hai.")
+
+    sample_rows = excel_io.df_preview(df, n=6)["rows"]
+
+    try:
+        parsed = generate_transform(
+            columns=list(df.columns),
+            sample_rows=sample_rows,
+            total_rows=len(df),
+            instruction=payload.instruction,
+        )
+        new_df = apply_transform(df, parsed["code"])
+    except TransformError as e:
+        raise HTTPException(422, str(e))
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"Unexpected error: {e}")
+
+    sessions.update_working_df(
+        payload.session_id, new_df,
+        instruction=payload.instruction,
+        explanation=parsed.get("explanation", ""),
+    )
+
+    return {
+        "explanation": parsed.get("explanation", ""),
+        "code": parsed["code"],
+        **excel_io.df_preview(new_df),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# ML: smart / fuzzy duplicate detection
+# --------------------------------------------------------------------------- #
+
+@router.post("/smart-duplicates")
+def smart_duplicates(payload: DedupeRequest):
+    df = _get_df_or_404(payload.session_id)
+    return ml_tools.find_smart_duplicates(df, columns=payload.columns, threshold=payload.threshold)
+
+
+@router.post("/apply-dedupe")
+def apply_dedupe(payload: ApplyDedupeRequest):
+    df = _get_df_or_404(payload.session_id)
+    new_df = ml_tools.apply_dedupe(df, payload.drop_indices)
+    sessions.update_working_df(
+        payload.session_id, new_df,
+        instruction="[smart-dedupe]",
+        explanation=f"{len(payload.drop_indices)} duplicate rows hataye gaye.",
+    )
+    return excel_io.df_preview(new_df)
+
+
+# --------------------------------------------------------------------------- #
+# ML: numeric anomaly detection (median absolute deviation — no heavy deps)
+# --------------------------------------------------------------------------- #
+
+@router.post("/detect-anomalies")
+def detect_anomalies(payload: AnomalyRequest):
+    df = _get_df_or_404(payload.session_id)
+    try:
+        result = ml_tools.detect_anomalies(df, payload.column, threshold=payload.threshold)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return result
+
+
+@router.post("/drop-rows")
+def drop_rows(payload: DropRowsRequest):
+    df = _get_df_or_404(payload.session_id)
+    new_df = df.drop(index=payload.row_indices).reset_index(drop=True)
+    sessions.update_working_df(
+        payload.session_id, new_df,
+        instruction="[manual-drop]",
+        explanation=f"{len(payload.row_indices)} rows manually hataye gaye.",
+    )
+    return excel_io.df_preview(new_df)
+
+
+# --------------------------------------------------------------------------- #
+# Missing-value detection + smart fill
+# --------------------------------------------------------------------------- #
+
+@router.post("/missing-values")
+def missing_values(payload: MissingValuesRequest):
+    df = _get_df_or_404(payload.session_id)
+    return ml_tools.missing_value_report(df)
+
+
+@router.post("/fill-missing")
+def fill_missing(payload: FillMissingRequest):
+    df = _get_df_or_404(payload.session_id)
+    if not payload.strategies:
+        raise HTTPException(400, "Koi fill strategy nahi di gayi.")
+
+    new_df = ml_tools.fill_missing(df, payload.strategies)
+    cols_filled = ", ".join(payload.strategies.keys())
+    sessions.update_working_df(
+        payload.session_id, new_df,
+        instruction="[fill-missing]",
+        explanation=f"Missing values fill kiye: {cols_filled}.",
+    )
+    return excel_io.df_preview(new_df)
+
+
+# --------------------------------------------------------------------------- #
+# Data quality report
+# --------------------------------------------------------------------------- #
+
+@router.get("/quality-report/{session_id}")
+def quality_report(session_id: str):
+    df = _get_df_or_404(session_id)
+    return quality.compute_report(df)
+
+
+# --------------------------------------------------------------------------- #
+# Undo / redo / history
+# --------------------------------------------------------------------------- #
+
+@router.post("/undo")
+def undo(payload: SessionIdRequest):
+    try:
+        df = sessions.undo(payload.session_id)
+    except sessions.SessionNotFound:
+        raise HTTPException(404, "Session nahi mila — file dobara upload karo.")
+    except sessions.NoUndoAvailable:
+        raise HTTPException(400, "Undo karne ke liye kuch nahi hai.")
+    return {"status": "undone", **excel_io.df_preview(df)}
+
+
+@router.post("/redo")
+def redo(payload: SessionIdRequest):
+    try:
+        df = sessions.redo(payload.session_id)
+    except sessions.SessionNotFound:
+        raise HTTPException(404, "Session nahi mila — file dobara upload karo.")
+    except sessions.NoRedoAvailable:
+        raise HTTPException(400, "Redo karne ke liye kuch nahi hai.")
+    return {"status": "redone", **excel_io.df_preview(df)}
+
+
+@router.get("/history/{session_id}")
+def history(session_id: str):
+    try:
+        return sessions.get_history_status(session_id)
+    except sessions.SessionNotFound:
+        raise HTTPException(404, "Session nahi mila — file dobara upload karo.")
+
+
+# --------------------------------------------------------------------------- #
+# Download
+# --------------------------------------------------------------------------- #
+
+@router.get("/download/{session_id}")
+def download(session_id: str, format: str = "xlsx"):  # noqa: A002 (query param name matches API contract)
+    df = _get_df_or_404(session_id)
+    fmt = format.lower()
+    short_id = session_id[:8]
+
+    if fmt == "csv":
+        return Response(
+            content=excel_io.df_to_csv_bytes(df),
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename=sheetvaidya-fixed-{short_id}.csv"},
+        )
+
+    if fmt == "pdf":
+        try:
+            filename = sessions.get_filename(session_id)
+        except sessions.SessionNotFound:
+            filename = "uploaded file"
+        report = quality.compute_report(df)
+        fix_history = sessions.get_history_status(session_id)["history"]
+        pdf_bytes = report_pdf.build_quality_report_pdf(filename, report, fix_history)
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename=sheetvaidya-quality-report-{short_id}.pdf"},
+        )
+
+    if fmt != "xlsx":
+        raise HTTPException(400, "format sirf 'xlsx', 'csv', ya 'pdf' ho sakta hai.")
+
+    return Response(
+        content=excel_io.df_to_xlsx_bytes(df),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename=sheetvaidya-fixed-{short_id}.xlsx"},
+    )
+
+
+# --------------------------------------------------------------------------- #
+
+def _get_df_or_404(session_id: str):
+    try:
+        return sessions.get_working_df(session_id)
+    except sessions.SessionNotFound:
+        raise HTTPException(404, "Session nahi mila — file dobara upload karo.")
+
+
+app.include_router(router)
